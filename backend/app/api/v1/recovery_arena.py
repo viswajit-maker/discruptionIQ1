@@ -18,9 +18,10 @@ GET    /recovery/{disruption_id}/audit      Audit trail for a disruption's plans
 from __future__ import annotations
 
 import json
+import logging
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,7 +31,8 @@ from app.core.database import get_db
 from app.core.permissions import Permission, normalize_role, role_has_permission
 from app.models.auth import User, UserRole
 from app.models.governance import DisruptionImpact, DisruptionRecord
-from app.models.recovery import PlanAuditEvent
+from app.models.recovery import PlanAuditEvent, RecoveryPlan
+from app.services.email_service import send_approval_notification
 from app.services.plan_executor import (
     ExecutionError,
     approve_plan,
@@ -42,6 +44,7 @@ from app.services.plan_executor import (
 from app.services.plan_simulator import compare_plans, create_plans, get_plan, list_plans, simulate_plan
 
 recovery_router = APIRouter(prefix="/recovery", tags=["Recovery Arena"])
+logger = logging.getLogger(__name__)
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
@@ -253,6 +256,7 @@ def submit_for_approval(
     body: SubmitPlanRequest,
     db: DbSession,
     current_user: CurrentUser,
+    background_tasks: BackgroundTasks,
 ) -> dict:
     """Move plan to `submitted` status and write audit event `plan_submitted`."""
     if not role_has_permission(current_user.role, Permission.PLANS_SUBMIT):
@@ -262,11 +266,40 @@ def submit_for_approval(
         )
 
     try:
-        return submit_plan_for_approval(
+        result = submit_plan_for_approval(
             db, plan_id, current_user.id, current_user.role, body.justification
         )
     except ExecutionError as e:
         raise _execution_error_to_http(e)
+
+    # Queue informational notification email via background task (non-blocking)
+    try:
+        plan = db.get(RecoveryPlan, plan_id)
+        if plan:
+            disruption = db.get(DisruptionRecord, plan.disruption_id)
+            disruption_title = disruption.title if disruption else f"Disruption {plan.disruption_id}"
+            request_id = plan.approval_id or f"REQ-{plan.id}"
+            cost = float(plan.estimated_cost_usd or 0.0)
+            projected_savings = round(cost * 1.5, 2)
+            background_tasks.add_task(
+                send_approval_notification,
+                request_id=request_id,
+                plan_id=plan.id,
+                plan_name=plan.name,
+                strategy_type=plan.strategy_type,
+                disruption_title=disruption_title,
+                disruption_id=plan.disruption_id,
+                submitted_by=plan.submitted_by or current_user.id,
+                submitted_at=plan.updated_at or plan.created_at,
+                estimated_cost_usd=cost,
+                orders_protected_count=plan.orders_protected_count or 0,
+                projected_savings_usd=projected_savings,
+                justification=body.justification,
+            )
+    except Exception as exc:
+        logger.warning("Failed to schedule approval notification email for plan %s: %s", plan_id, exc)
+
+    return result
 
 
 @recovery_router.post(

@@ -1,11 +1,18 @@
 """Environment-backed application configuration."""
+from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, Field
-from datetime import datetime, timezone
-from pydantic_settings import NoDecode
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
+_ENV_FILES = (
+    str(_BACKEND_DIR / ".env"),
+    "backend/.env",
+    ".env",
+)
 
 
 def _parse_origins(value: object) -> list[str]:
@@ -23,7 +30,7 @@ CorsOrigins = Annotated[list[str], NoDecode, BeforeValidator(_parse_origins)]
 class Settings(BaseSettings):
     """Settings loaded from environment variables and an optional .env file."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILES, env_file_encoding="utf-8", extra="ignore")
 
     project_name: str = "DisruptionIQ API"
     version: str = "0.1.0"
@@ -63,6 +70,12 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_login_max_attempts: int = 5
     rate_limit_window_seconds: int = 60
+
+    # Email notifications via Resend
+    resend_api_key: str | None = None
+    approver_email: str | None = None
+    email_from: str = "onboarding@resend.dev"
+    app_base_url: str = "http://localhost:3000"
 
 
 @lru_cache
